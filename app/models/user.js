@@ -1,7 +1,9 @@
 import crypto from 'crypto'
 
 import bcrypt from 'bcrypt'
-import { promisifyAll } from 'bluebird'
+import { promisify, promisifyAll } from 'bluebird'
+import aws from 'aws-sdk'
+import fs from 'fs'
 import gm from 'gm'
 import GraphemeBreaker from 'grapheme-breaker'
 import _ from 'lodash'
@@ -10,7 +12,7 @@ import validator from 'validator'
 import uuid from 'uuid'
 
 import { load as configLoader } from "../../config/config"
-import { BadRequestException, ForbiddenException, NotFoundException } from '../support/exceptions'
+import { BadRequestException, ForbiddenException, NotFoundException, ValidationException } from '../support/exceptions'
 import { Attachment, Comment, Post, Stats, Timeline } from '../models'
 
 
@@ -32,6 +34,7 @@ exports.addModel = function(dbAdapter) {
     this.screenName = params.screenName
     this.email = params.email
     this.description = params.description || ''
+    this.frontendPreferences = params.frontendPreferences || {}
 
     if (!_.isUndefined(params.hashedPassword)) {
       this.hashedPassword = params.hashedPassword
@@ -68,7 +71,6 @@ exports.addModel = function(dbAdapter) {
 
   User.PROFILE_PICTURE_SIZE_LARGE = 75
   User.PROFILE_PICTURE_SIZE_MEDIUM = 50
-  User.PROFILE_PICTURE_SIZE_SMALL = 25
 
   Object.defineProperty(User.prototype, 'username', {
     get: function() { return this.username_ },
@@ -109,11 +111,23 @@ exports.addModel = function(dbAdapter) {
     }
   })
 
-  User.stopList = (default_stop_list) => {
-    if (default_stop_list)
-      return config.application.DEFAULT_STOP_LIST
+  Object.defineProperty(User.prototype, 'frontendPreferences', {
+    get: function() { return this.frontendPreferences_ },
+    set: function(newValue) {
+      if (_.isString(newValue)) {
+        newValue = JSON.parse(newValue)
+      }
 
-    return config.application.USERNAME_STOP_LIST
+      this.frontendPreferences_ = newValue
+    }
+  })
+
+  User.stopList = (skipExtraList) => {
+    if (skipExtraList) {
+      return config.application.USERNAME_STOP_LIST
+    }
+
+    return config.application.USERNAME_STOP_LIST.concat(config.application.EXTRA_STOP_LIST)
   }
 
   User.prototype.isUser = function() {
@@ -227,13 +241,35 @@ exports.addModel = function(dbAdapter) {
     return (len <= 1500)
   }
 
+  User.frontendPreferencesIsValid = function(frontendPreferences) {
+    // Check size
+    const prefString = JSON.stringify(frontendPreferences)
+    const len = GraphemeBreaker.countBreaks(prefString)
+    if (len > config.frontendPreferencesLimit) {
+      return false
+    }
+
+    // Check structure
+    // (for each key in preferences there must be an object value)
+    if (!_.isPlainObject(frontendPreferences)) {
+      return false
+    }
+    for (let prop in frontendPreferences) {
+      if (!frontendPreferences[prop] || typeof frontendPreferences[prop] !== 'object') {
+        return false
+      }
+    }
+
+    return true
+  }
+
   User.prototype.validate = async function(skip_stoplist) {
     if (!this.isValidUsername(skip_stoplist)) {
       throw new Error('Invalid username')
     }
 
     if (!this.isValidScreenName()) {
-      throw new Error('Invalid screenname')
+      throw new Error(`"${this.screenName}" is not a valid display name. Names must be between 3 and 25 characters long.`)
     }
 
     if (!await this.isValidEmail()) {
@@ -294,7 +330,8 @@ exports.addModel = function(dbAdapter) {
       'description':    '',
       'createdAt':      this.createdAt.toString(),
       'updatedAt':      this.updatedAt.toString(),
-      'hashedPassword': this.hashedPassword
+      'hashedPassword': this.hashedPassword,
+      'frontendPreferences': JSON.stringify({})
     }
     this.id = await dbAdapter.createUser(payload)
 
@@ -316,7 +353,7 @@ exports.addModel = function(dbAdapter) {
 
     if (params.hasOwnProperty('screenName') && params.screenName != this.screenName) {
       if (!this.screenNameIsValid(params.screenName)) {
-        throw new Error("Invalid screenname")
+        throw new Error(`"${params.screenName}" is not a valid display name. Names must be between 3 and 25 characters long.`)
       }
 
       this.screenName = params.screenName
@@ -359,6 +396,23 @@ exports.addModel = function(dbAdapter) {
       hasChanges = true
     }
 
+    if (params.hasOwnProperty('frontendPreferences')) {
+      // Validate the input object
+      if (!User.frontendPreferencesIsValid(params.frontendPreferences)) {
+        throw new ValidationException('Invalid frontendPreferences')
+      }
+
+      // Deep-merge objects
+      _.merge(this.frontendPreferences, params.frontendPreferences)
+
+      // Validate the merged object
+      if (!User.frontendPreferencesIsValid(this.frontendPreferences)) {
+        throw new ValidationException('Invalid frontendPreferences')
+      }
+
+      hasChanges = true
+    }
+
     if (hasChanges) {
       this.updatedAt = new Date().getTime()
 
@@ -367,6 +421,7 @@ exports.addModel = function(dbAdapter) {
         'email': this.email,
         'isPrivate': this.isPrivate,
         'description': this.description,
+        'frontendPreferences': JSON.stringify(this.frontendPreferences),
         'updatedAt': this.updatedAt.toString()
       }
 
@@ -861,8 +916,7 @@ exports.addModel = function(dbAdapter) {
 
     let sizes = [
       User.PROFILE_PICTURE_SIZE_LARGE,
-      User.PROFILE_PICTURE_SIZE_MEDIUM,
-      User.PROFILE_PICTURE_SIZE_SMALL
+      User.PROFILE_PICTURE_SIZE_MEDIUM
     ]
 
     let promises = sizes.map(size => this.saveProfilePictureWithSize(file.path, this.profilePictureUuid, originalSize, size))
@@ -878,10 +932,12 @@ exports.addModel = function(dbAdapter) {
     return dbAdapter.updateUser(this.id, payload)
   }
 
-  User.prototype.saveProfilePictureWithSize = function(path, uuid, originalSize, size) {
+  User.prototype.saveProfilePictureWithSize = async function(path, uuid, originalSize, size) {
     var image = promisifyAll(gm(path))
     var origWidth = originalSize.width
     var origHeight = originalSize.height
+    var retinaSize = size * 2
+
     if (origWidth > origHeight) {
       var dx = origWidth - origHeight
       image = image.crop(origHeight, origHeight, dx / 2, 0)
@@ -889,10 +945,42 @@ exports.addModel = function(dbAdapter) {
       var dy = origHeight - origWidth
       image = image.crop(origWidth, origWidth, 0, dy / 2)
     }
-    image = image.resize(size, size)
-    image = image.quality(95)
+
+    image = image
+      .resize(retinaSize, retinaSize)
+      .profile(__dirname + '/../../lib/assets/sRGB_v4_ICC_preference.icc')
+      .autoOrient()
+      .quality(95)
+
+    if (config.profilePictures.storage.type === 's3') {
+      const tmpPictureFile = path + '.resized.' + size
+      const destPictureFile = this.getProfilePictureFilename(uuid, size)
+
+      await image.writeAsync(tmpPictureFile)
+      await this.uploadToS3(tmpPictureFile, destPictureFile, config.profilePictures)
+
+      return fs.unlinkAsync(tmpPictureFile)
+    }
+
     var destPath = this.getProfilePicturePath(uuid, size)
     return image.writeAsync(destPath)
+  }
+
+  // Upload profile picture to the S3 bucket
+  User.prototype.uploadToS3 = async function(sourceFile, destFile, subConfig) {
+    const s3 = new aws.S3({
+      'accessKeyId': subConfig.storage.accessKeyId || null,
+      'secretAccessKey': subConfig.storage.secretAccessKey || null
+    })
+    const putObject = promisify(s3.putObject, {context: s3})
+    await putObject({
+      ACL: 'public-read',
+      Bucket: subConfig.storage.bucket,
+      Key: subConfig.path + destFile,
+      Body: fs.createReadStream(sourceFile),
+      ContentType: 'image/jpeg',
+      ContentDisposition: 'inline'
+    })
   }
 
   User.prototype.getProfilePicturePath = function(uuid, size) {
@@ -975,6 +1063,19 @@ exports.addModel = function(dbAdapter) {
     if (!_.includes(timelineIds, timelineId)) {
       throw new ForbiddenException("You are not subscribed to that user")
     }
+
+    const timeline = await dbAdapter.getTimelineById(timelineId)
+    const feedOwner = await dbAdapter.getFeedOwnerById(timeline.userId)
+
+    if ('group' !== feedOwner.type) {
+      return
+    }
+
+    const adminIds = await feedOwner.getAdministratorIds()
+
+    if (_.includes(adminIds, this.id)) {
+      throw new ForbiddenException("Group administrators cannot unsubscribe from own groups")
+    }
   }
 
   /* checks if user can like some post */
@@ -1023,7 +1124,7 @@ exports.addModel = function(dbAdapter) {
       let payload = {
         'updatedAt': updatedAt.toString()
       }
-      return dbAdapter.updateUser(this.id, payload)
+      await dbAdapter.updateUser(this.id, payload)
     }
   }
 
@@ -1034,6 +1135,16 @@ exports.addModel = function(dbAdapter) {
     return await Promise.all([
       dbAdapter.createUserSubscriptionRequest(this.id, currentTime, userId),
       dbAdapter.createUserSubscriptionPendingRequest(this.id, currentTime, userId)
+    ])
+  }
+
+  User.prototype.sendPrivateGroupSubscriptionRequest = async function(groupId) {
+    await this.validateCanSendPrivateGroupSubscriptionRequest(groupId)
+
+    const currentTime = new Date().getTime()
+    return await Promise.all([
+      dbAdapter.createUserSubscriptionRequest(this.id, currentTime, groupId),
+      dbAdapter.createUserSubscriptionPendingRequest(this.id, currentTime, groupId)
     ])
   }
 
@@ -1094,6 +1205,24 @@ exports.addModel = function(dbAdapter) {
       throw new Error("Invalid")
   }
 
+  User.prototype.validateCanSendPrivateGroupSubscriptionRequest = async function(groupId) {
+    const hasRequest = await dbAdapter.isSubscriptionRequestPresent(this.id, groupId)
+    let hasSubscription = false
+    const followedGroups = await this.getFollowedGroups()
+    const followedGroupIds = followedGroups.map((group) => {
+      return group.id
+    })
+    hasSubscription  = _.includes(followedGroupIds, groupId)
+    const group = await dbAdapter.getGroupById(groupId)
+
+    if (hasRequest)
+      throw new ForbiddenException("Subscription request already sent")
+    if (hasSubscription)
+      throw new ForbiddenException("You are already subscribed to that group")
+    if (!!group && group.isPrivate !== '1')
+      throw new Error("Group is public")
+  }
+
   User.prototype.validateCanManageSubscriptionRequests = async function(userId) {
     var hasRequest = await dbAdapter.isSubscriptionRequestPresent(userId, this.id)
 
@@ -1119,6 +1248,61 @@ exports.addModel = function(dbAdapter) {
     }
 
     return true
+  }
+
+  User.prototype.getFollowedGroups = async function () {
+    const timelinesIds = await dbAdapter.getUserSubscriptionsIds(this.id)
+    if (timelinesIds.length === 0)
+      return []
+
+    const timelines = await dbAdapter.getTimelinesByIds(timelinesIds)
+    if (timelines.length === 0)
+      return []
+
+    const timelineOwnerIds = _(timelines).map('userId').uniq().value()
+    if (timelineOwnerIds.length === 0)
+      return []
+
+    const timelineOwners = await dbAdapter.getFeedOwnersByIds(timelineOwnerIds)
+    if (timelineOwners.length === 0)
+      return []
+
+    let followedGroups = timelineOwners.filter((owner) => {
+      return 'group' === owner.type
+    })
+
+    return followedGroups
+  }
+
+  User.prototype.getManagedGroups = async function () {
+    const followedGroups = await this.getFollowedGroups()
+    const currentUserId  = this.id
+
+    let promises = followedGroups.map( async (group)=>{
+      const adminIds = await group.getAdministratorIds()
+      if (adminIds.indexOf(currentUserId) !== -1) {
+        return group
+      }
+      return null
+    })
+
+    let managedGroups = await Promise.all(promises)
+    return _.compact(managedGroups)
+  }
+
+  User.prototype.pendingPrivateGroupSubscriptionRequests = async function () {
+    const managedGroups = await this.getManagedGroups()
+
+    let promises = managedGroups.map(async (group)=>{
+      let unconfirmedFollowerIds = await group.getSubscriptionRequestIds()
+      return unconfirmedFollowerIds.length > 0
+    })
+
+    return _.some((await Promise.all(promises)), Boolean)
+  }
+
+  User.prototype.getPendingGroupRequests = function () {
+    return this.pendingPrivateGroupSubscriptionRequests()
   }
 
   return User

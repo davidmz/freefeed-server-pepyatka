@@ -296,8 +296,12 @@ async function postJson(relativeUrl, data) {
   )
 }
 
+export async function createUserAsyncPost(user) {
+  return postJson(`/v1/users`, user)
+}
+
 export async function createUserAsync(username, password, attributes) {
-  if (typeof attributes === 'undefined'){
+  if (typeof attributes === 'undefined') {
     attributes = {}
   }
 
@@ -310,7 +314,7 @@ export async function createUserAsync(username, password, attributes) {
     user.email = attributes.email
   }
 
-  let response = await postJson(`/v1/users`, user)
+  let response = await createUserAsyncPost(user)
   let data = await response.json()
 
   let userData = data.users
@@ -325,8 +329,22 @@ export async function createUserAsync(username, password, attributes) {
   }
 }
 
+export function whoami(authToken) {
+  return postJson(
+    '/v1/users/whoami',
+    {
+      authToken: authToken,
+      '_method': 'get'
+    }
+  )
+}
+
 export function like(postId, authToken) {
   return postJson(`/v1/posts/${postId}/like`, { authToken })
+}
+
+export function unlike(postId, authToken) {
+  return postJson(`/v1/posts/${postId}/unlike`, { authToken })
 }
 
 export function updateUserAsync(userContext, user) {
@@ -335,6 +353,17 @@ export function updateUserAsync(userContext, user) {
     {
       authToken: userContext.authToken,
       user,
+      '_method': 'put'
+    }
+  )
+}
+
+export function updateGroupAsync(group, adminContext, groupData) {
+  return postJson(
+    `/v1/users/${group.id}`,
+    {
+      authToken: adminContext.authToken,
+      user: groupData,
       '_method': 'put'
     }
   )
@@ -358,6 +387,10 @@ export function goPublic(userContext) {
   return updateUserAsync(userContext, { isPrivate: "0" });
 }
 
+export function groupToPrivate(group, userContext) {
+  return updateGroupAsync(group, userContext, { isPrivate: "1" });
+}
+
 export function subscribeToAsync(subscriber, victim) {
   return postJson(`/v1/users/${victim.username}/subscribe`, {authToken: subscriber.authToken})
 }
@@ -378,12 +411,12 @@ export async function mutualSubscriptions(userContexts) {
   await Promise.all(promises)
 }
 
-export async function createAndReturnPost(userContext, body) {
+export async function createAndReturnPostToFeed(feed, userContext, body) {
   let response = await postJson(
     '/v1/posts',
     {
       post: {body},
-      meta: {feeds: userContext.username},
+      meta: {feeds: feed.username},
       authToken: userContext.authToken
     }
   )
@@ -391,6 +424,10 @@ export async function createAndReturnPost(userContext, body) {
   let data = await response.json()
 
   return data.posts
+}
+
+export function createAndReturnPost(userContext, body) {
+  return createAndReturnPostToFeed(userContext, userContext, body)
 }
 
 export function createCommentAsync (userContext, postId, body) {
@@ -443,8 +480,8 @@ export function enableComments(postId, authToken) {
   return postJson(`/v1/posts/${postId}/enableComments`, { authToken })
 }
 
-export async function createPostViaBookmarklet(userContext, title, comment, image) {
-  let parameters = {
+export async function createPostViaBookmarklet(userContext, title, comment, image, feeds) {
+  const parameters = {
     authToken: userContext.authToken,
     title,
     comment: comment ? comment : '',
@@ -455,6 +492,11 @@ export async function createPostViaBookmarklet(userContext, title, comment, imag
     throw new Error('Attachments support is not implemented in test-helper for Bookmarklet-requests')
   }
 
+  // we do not fill "meta" always, as older clients do not do this
+  if (feeds) {
+    parameters.meta = { feeds }
+  }
+
   return postJson(`/v1/bookmarklet`, parameters)
 }
 
@@ -462,6 +504,7 @@ export async function createMockAttachmentAsync(context) {
   const attachmentId  = uuid.v4()
   const params = {
     fileName: 'lion.jpg',
+    fileSize: 12345,
     userId: context.user.id,
     postId: '',
     createdAt: (new Date()).toString(),
@@ -486,3 +529,33 @@ export function updatePostAsync(context, post) {
     }
   )
 }
+
+export async function createGroupAsync(context, username, screenName) {
+  let params = {
+    group: {
+      username: username,
+      screenName: screenName || username
+    },
+    authToken: context.authToken
+  }
+
+  let response = await postJson(`/v1/groups`, params)
+  let data = await response.json()
+
+  return {
+    group: data.groups,
+    username: username
+  }
+}
+
+export function promoteToAdmin(group, existingAdminContext, potentialAdminContext) {
+  return postJson(
+    `/v1/groups/${group.username}/subscribers/${potentialAdminContext.user.username}/admin`,
+    {authToken: existingAdminContext.authToken}
+  )
+}
+
+export function sendRequestToJoinGroup(subscriber, group) {
+  return postJson(`/v1/groups/${group.username}/sendRequest`, {authToken: subscriber.authToken})
+}
+

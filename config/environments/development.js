@@ -29,32 +29,33 @@ export function getConfig() {
     onboardingUsername: 'welcome',
     recaptcha: {
       enabled: false
-    }
+    },
+
+    frontendPreferencesLimit: 65536
   }
 
   config.host = 'http://localhost:' + config.port
 
-  var defaultStopList = [
-    '404', 'about', 'account', 'anonymous', 'attachments', 'files', 'filter',
-    'friends', 'groups', 'help', 'home', 'iphone', 'list', 'logout', 'profilepics',
-    'public', 'requests', 'search', 'settings', 'share', 'signin', 'signup', 'summary'
-  ]
-
   config.application = {
-    DEFAULT_STOP_LIST: defaultStopList,
-    // Pepyatka won't allow users to use the following usernames, they
-    // are reserved for internal pages.
-    //
-    // To load this list from <PEPYATKA_HOME>/banlist.txt (one
-    // username per line) file use the following snippet:
+    // Unavailable for registration (reserved for internal use)
+    USERNAME_STOP_LIST: [
+      '404', 'about', 'account', 'anonymous', 'attachments', 'dev', 'files', 'filter',
+      'friends', 'groups', 'help', 'home', 'iphone', 'list', 'logout', 'profilepics',
+      'public', 'requests', 'search', 'settings', 'share', 'signin', 'signup', 'summary'
+    ],
+
+    // Unavailable for public registration (legacy reasons)
+    EXTRA_STOP_LIST: []
+
+    // To load the list from <FREEFEED_HOME>/banlist.txt (one username per line)
+    // use the following snippet:
     //
     // var fs = require('fs')
     // var array = fs.readFileSync('banlist.txt').toString()
-    //               .split("\n").filter(function(n) { return n != '' })
+    //               .split('\n').filter(function(n) { return n != '' })
     // config.application {
-    //   USERNAME_STOP_LIST = array
+    //   EXTRA_STOP_LIST = array
     // }
-    USERNAME_STOP_LIST: defaultStopList
   }
 
   config.media = {
@@ -79,20 +80,21 @@ export function getConfig() {
     url: config.media.url,
     storage: config.media.storage,
     path: 'attachments/', // must have trailing slash
-    fileSizeLimit: '10mb'
-  }
-  config.thumbnails = {
-    url: config.media.url,
-    storage: config.media.storage,
-    path: 'attachments/thumbnails/' // must have trailing slash
+    fileSizeLimit: '10mb',
+    imageSizes: {
+      t: {
+        path: 'attachments/thumbnails/', // must have trailing slash
+        bounds: { width: 525, height: 175 }
+      },
+      t2: {
+        path: 'attachments/thumbnails2/', // must have trailing slash
+        bounds: { width: 1050, height: 350 }
+      }
+    }
   }
   config.profilePictures = {
-    // Profile pictures only support 'fs' for the time being, so we won't use shared values by default
-    url: config.host + '/',
-    storage: {
-      type: 'fs',
-      rootDir: config.media.storage.rootDir
-    },
+    url: config.media.url,
+    storage: config.media.storage,
     path: 'profilepics/' // must have trailing slash
   }
 

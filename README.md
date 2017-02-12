@@ -1,43 +1,55 @@
-Pepyatka
-========
+FreeFeed Server
+===============
 
-[![Build Status](https://api.travis-ci.org/pepyatka/pepyatka-server.png)](https://travis-ci.org/pepyatka/pepyatka-server)
+FreeFeed is a social network that enables you to discover and discuss the interesting
+stuff your friends find on the web.
 
-Pepyatka is an open source FriendFeed clone. Basically, this is a
-social real-time feed aggregator that allows you to share cute kitty
-photos, coordinate upcoming events, discuss any other cool stuff on
-the Internet or setup a private Pepyatka instance in your company.
+FreeFeed is being built as a replacement for FriendFeed, the real-time aggregator and social network
+where "likes" for user generated content were implemented for the first time.
 
-Find out more
--------------
+FreeFeed is based on [Pepyatka](https://github.com/pepyatka/pepyatka-server/) project
 
-1. [Setting up Pepyatka](https://github.com/pepyatka/pepyatka-server/wiki/Setting-up-Pepyatka)
-1. [Pepyatka on HTTPS](https://github.com/pepyatka/pepyatka-server/wiki/Pepyatka-on-HTTPS)
-1. [Database](https://github.com/pepyatka/pepyatka-server/wiki/Database)
-1. [API](https://github.com/pepyatka/pepyatka-server/wiki/API)
-1. [REST API by examples](https://github.com/pepyatka/pepyatka-server/wiki/REST-API-example)
-1. [NTLM support](https://github.com/pepyatka/pepyatka-server/wiki/NTLM-support)
+Setting out FreeFeed on OSX
+---------------------------
+
+1. brew install redis
+1. brew install graphicsmagick --with-jasper --with-little-cms2 --with-webp
+1. brew install nvm
+1. nvm install
+1. npm install
+
+Setting out database on OSX
+---------------------------
+1. brew install postgres
+1. postgres.server start
+1. createuser -P -s freefeed (enter freefeed as password)
+1. createdb -O freefeed freefeed
+1. cp knexfile.js{.dist,}
+1. ./node_modules/.bin/knex migrate:latest
+
+Starting up FreeFeed
+-------------------
+1. mkdir ./public/files/attachments/thumbnails/ && mkdir ./public/files/attachments/thumbnails2/
+1. redis-server /usr/local/etc/redis.conf
+1. npm start
+
+Testing
+-------------------
+1. /usr/local/Cellar/postgresql/{VERSION}/bin/createuser -s postgres
+1. createdb -O freefeed freefeed_test
+1. npm test
 
 Contribute
 ----------
 
-1. [How to contribute](https://github.com/pepyatka/pepyatka-server/wiki/How-to-contribute)
-1. [Code style](https://github.com/pepyatka/pepyatka-server/wiki/Code-style)
-
-Roadmap
--------
-
-Tasks: https://github.com/pepyatka/pepyatka-server/issues
+1. [How to contribute](https://freefeed.net/dev)
 
 Questions or need help?
 -----------------------
 
-You can drop a question [here](http://pepyatka.com/users/pepyatka) or
-[there](http://friendfeed.com/pepyatka).
+You can drop your question [here](https://freefeed.net/support).
 
 Copyright and license
 ---------------------
 
-Pepyatka itself is licensed under the MIT License.
-
-https://github.com/epicmonkey/pepyatka/blob/master/LICENSE
+FreeFeed is licensed under the MIT License.

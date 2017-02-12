@@ -1,35 +1,39 @@
-import async from 'async'
-import { promisify } from 'bluebird'
 import _ from 'lodash'
 import s from 'underscore.string'
 
 
-export const AbstractSerializer = function(object, strategy) {
+export const AbstractSerializer = function (object, strategy) {
   this.object   = object
   this.strategy = strategy
 }
 
 AbstractSerializer.prototype = {
-  END_POINT: 1,
+  END_POINT:       1,
   NESTED_STRATEGY: 2,
-  THROUGH_POINT: 3,
+  THROUGH_POINT:   3,
+  RELATION_POINT:  4,
 
-  getField: function(field, f) {
+  RELATIONS_STORAGE: '__relations',
+
+  getField: async function (field) {
     if (!this.object) {
-      f(null, null)
-    } else if (!this.object[field]) {
-      var name = "get" + s(field).capitalize().value()
-      var method = this.object[name]
+      return null
+    }
+    if (!this.object[field]) {
+      const fieldName = s(field).capitalize().value();
+      const name = `get${fieldName}`
+      const method = this.object[name]
 
       if (method) {
-        method.apply(this.object)
-          .then(function(object) { f(null, object) })
-          .catch(function(e) { f(e, null) })
-      } else { f(null, null) }
-    } else { f(null, this.object[field]) }
+        return await Reflect.apply(method, this.object, []);
+      }
+      return null
+    }
+
+    return this.object[field]
   },
 
-  decideNode: function(field) {
+  decideNode: function (field) {
     if (!this.strategy[field]) {
       return this.END_POINT
     }
@@ -38,186 +42,246 @@ AbstractSerializer.prototype = {
       return this.THROUGH_POINT
     }
 
+    if (this.strategy[field].relation) {
+      return this.RELATION_POINT
+    }
+
     return this.NESTED_STRATEGY
   },
 
-  prepareNestedField: function(name) {
-    var nestedField = name
+  processMultiObjects: async function (objects, strategy, serializer, root, level) {
+    const promises = []
 
-    if (name[name.length - 1] === 's') {
-      nestedField = name.substr(0, name.length-1) + "Ids"
-    } else {
-      nestedField += "Id"
-    }
-
-    return nestedField
-  },
-
-  processMultiObjects: function(objects, strategy, serializer, root, level, f) {
-    var result = []
-    var jsonAdder = function(done) {
-      return function(err, json) {
-        result.push(json)
-        done(err)
-      }
-    }
-
-    async.forEach(objects, function(object, done) {
+    for (const object of objects) {
+      let selectedSerializer
       if (serializer) {
-        new serializer(object).toJSON(jsonAdder(done), root, level + 1)
+        selectedSerializer = new serializer(object)
       } else {
-        new AbstractSerializer(object, strategy).toJSON(jsonAdder(done), root, level + 1)
+        selectedSerializer = new AbstractSerializer(object, strategy)
       }
-    }, function(err) {
-      f(err, result)
-    })
-  },
-
-  processMultiObjectsWithRoot: function(field, objects, strategy, serializer, root, level, f) {
-    var result = []
-    var jsonAdder = function(done) {
-      return function(err, json) {
-        result.push(json)
-        done(err)
-      }
+      const promise = selectedSerializer.promiseToJSON(root, level + 1)
+      promises.push(promise)
     }
 
-    var node = serializer ? new serializer(objects[0]).name : field
-    async.eachSeries(objects, function(object, done) {
-      // Does not request objects that already has been serialized
-      // and they are in root.
-      var inArray = _.any(root[node], function(item) {
-        return item.id == object.id
-      })
+    return Promise.all(promises)
+  },
 
+  processMultiObjectsWithRoot: async function (field, objects, strategy, serializer, root, level) {
+    const promises = []
+
+    const node = serializer ? new serializer(objects[0]).name : field
+
+    for (const object of objects) {
+      const inArray = _.some(root[node], (item) => (item.id == object.id))
+
+      let selectedSerializer
       if (!inArray) {
         if (serializer) {
-          new serializer(object).toJSON(jsonAdder(done), root, level + 1)
+          selectedSerializer = new serializer(object)
         } else {
-          new AbstractSerializer(object, strategy).toJSON(jsonAdder(done), root, level + 1)
+          selectedSerializer = new AbstractSerializer(object, strategy)
         }
-      } else {
-        done()
+        const promise = selectedSerializer.promiseToJSON(root, level + 1)
+        promises.push(promise)
       }
-    }, function(err) {
-      if (typeof root[node] === 'undefined') {
-        root[node] = result
-      } else {
-        root[node] = root[node].concat(result)
-      }
+    }
 
-      f(err)
-    })
+    const results = await Promise.all(promises)
+
+    if (typeof root[node] === 'undefined') {
+      root[node] = results
+    } else {
+      root[node] = root[node].concat(results)
+    }
   },
 
-  getMaybeObjects: function(field, one, many) {
-    this.getField(field, function(err, object) {
-      Array.isArray(object) ? many(object) : one(object)
-    })
+  processNestedStrategy: async function (field, root, level) {
+    const fieldValue = await this.getField(field)
+
+    if (!Array.isArray(fieldValue)) {
+      return new AbstractSerializer(fieldValue, this.strategy[field]).promiseToJSON(root, level + 1)
+    }
+
+    return this.processMultiObjects(fieldValue, this.strategy[field], null, root, level)
   },
 
-  processNestedStrategy: function(field, f, root, level) {
-    var serializer = this
+  processThroughPoint: async function (field, root, level) {
+    const serializer = this
 
-    serializer.getMaybeObjects(field, function(object) {
-      new AbstractSerializer(object, serializer.strategy[field]).toJSON(f, root, level + 1)
-    }, function(objects) {
-      serializer.processMultiObjects(objects, serializer.strategy[field], null, root, level, f)
-    })
-  },
+    const processWithRoot = async function (_objects, one) {
+      const objects = _.filter(_objects, (object) => _.has(object, 'id'))
+      const objectIds = objects.map((e) => e.id)
+      const strategy = serializer.strategy[field]
 
-  processThroughPoint: function(field, f, root, level) {
-    var serializer = this
-
-    var processWithRoot = function(_objects, one) {
-      var objects = _.filter(_objects, function(object) { return _.has(object, 'id') })
-      var objectIds = objects.map(function(e) { return e.id })
-      var strategy = serializer.strategy[field]
-
-      serializer.processMultiObjectsWithRoot(strategy.model || field,
+      await serializer.processMultiObjectsWithRoot(strategy.model || field,
                                              objects,
                                              strategy,
                                              strategy.through,
                                              root,
-                                             level, function(err) {
-        if (one)
-          objectIds = objectIds[0]
+                                             level)
 
-        f(err, objectIds)
-      })
+      return one ? objectIds[0] : objectIds;
     }
 
-    serializer.getMaybeObjects(field, function(object) {
-      if (serializer.strategy[field].embed) {
-        if (object) {
-          processWithRoot([object], true)
-        } else {
-          f(null, null)
+    const fieldValue = await this.getField(field)
+    if (!Array.isArray(fieldValue)) {
+      if (this.strategy[field].embed) {
+        if (fieldValue) {
+          return processWithRoot([fieldValue], true)
         }
-      } else {
-        new serializer.strategy[field].through(object).toJSON(f)
+        return null
       }
-    }, function(objects) {
-      if (typeof objects != 'undefined' && objects.length > 0) {
-        if (serializer.strategy[field].embed) {
-          processWithRoot(objects)
-        } else {
-          serializer.processMultiObjects(objects, null, serializer.strategy[field].through, root, level, f)
-        }
-      } else {
-        f(null, null)
+      return new this.strategy[field].through(fieldValue).promiseToJSON()
+    }
+
+    if (typeof fieldValue != 'undefined' && fieldValue.length > 0) {
+      if (this.strategy[field].embed) {
+        return processWithRoot(fieldValue)
       }
-    })
+
+      return this.processMultiObjects(fieldValue, null, this.strategy[field].through, root, level)
+    }
+
+    return null
   },
 
-  processNode: function(jsonAdder, root, level) {
-    var serializer = this
+  processRelationPoint: async function (field, root) {
+    const serializer = new this.strategy[field].serializeUsing(null)
+    const modelName = serializer.name
+    const tempIdsStorageName = `__${modelName}_ids`
+    const storeTempModelIds = (modelIds) => {
+      if (!root[this.RELATIONS_STORAGE]) {
+        root[this.RELATIONS_STORAGE] = {}
+      }
+      this.strategy[field].objectIdsKey = tempIdsStorageName
 
-    return function(field, done) {
-      switch (serializer.decideNode(field)) {
-
-      case serializer.END_POINT:
-        serializer.getField(field, jsonAdder(field, done))
-        break
-
-      case serializer.NESTED_STRATEGY:
-        serializer.processNestedStrategy(field, jsonAdder(field, done), root, level)
-        break
-
-      case serializer.THROUGH_POINT:
-        var node = serializer.embed ? serializer.prepareNestedField(field) : field
-        serializer.processThroughPoint(field, jsonAdder(node, done), root, level)
-        break
+      root[this.RELATIONS_STORAGE][modelName] = this.strategy[field]
+      if (typeof root[tempIdsStorageName] === 'undefined') {
+        root[tempIdsStorageName] = modelIds
+      } else {
+        root[tempIdsStorageName] = root[tempIdsStorageName].concat(modelIds)
       }
     }
+
+    const fieldValue = await this.getField(field)
+    if (!Array.isArray(fieldValue)) {
+      if (fieldValue) {
+        storeTempModelIds([fieldValue])
+        return fieldValue
+      }
+      return null
+    }
+
+    if (typeof fieldValue != 'undefined' && fieldValue.length > 0) {
+      storeTempModelIds(fieldValue)
+      return fieldValue
+    }
+
+    return null
   },
 
-  toJSON: function(f, root, level) {
-    var json = {}
+  processNode: async function (root, field, level) {
+    const fieldType = this.decideNode(field)
+    let res
+    switch (fieldType) {
+      case this.END_POINT:
+        res = await this.getField(field)
+        break
+
+      case this.NESTED_STRATEGY:
+        res = await this.processNestedStrategy(field, root, level)
+        break
+
+      case this.THROUGH_POINT:
+        res = await this.processThroughPoint(field, root, level)
+        break
+
+      case this.RELATION_POINT:
+        res = this.processRelationPoint(field, root, level)
+        break
+    }
+
+    return res
+  },
+
+  promiseToJSON: async function (root, level) {
+    if (!this.strategy.select) {
+      return {}
+    }
+
+    const json = {};
     root = root || {}
     level = level || 0
-    var jsonAdder = function(field, done) {
-      return function(err, res) {
-        if (res != null) {
-          json[field] = res
+
+    const nodeProcessor = async (fieldName) => {
+      const res = await this.processNode(root, fieldName, level + 1)
+      if (res != null) {
+        const currentStrategy = this.strategy[fieldName]
+        if (currentStrategy && currentStrategy['relation'] && currentStrategy['customFieldName']) {
+          fieldName = currentStrategy['customFieldName']
         }
-        done(err)
+
+        json[fieldName] = res
       }
     }
 
-    var name = this.name
-    async.forEach(this.strategy.select, this.processNode(jsonAdder, root, level + 1) , function(err) {
-      if (level === 0) {
-        var inner_json = json
-        json = {}
-        json[name] = inner_json
+    const name = this.name
+    const promises = []
+    for (const fieldName of this.strategy.select) {
+      promises.push(nodeProcessor(fieldName))
+    }
 
-        json = _.extend(json, root)
+    await Promise.all(promises)
+
+    if (level !== 0) {
+      return json;
+    }
+
+    await this.loadRelations(root, level);
+
+    return { [name]: json, ...root };
+  },
+
+  loadRelations: function (root, level) {
+    const relations = root[this.RELATIONS_STORAGE]
+    if (!relations) {
+      return null
+    }
+
+    const relationsDescr = _.map(relations, (descr, k) => {
+      descr.relKey = k
+
+      let relatedObjectsIds = _.uniq(root[descr.objectIdsKey])
+      let existingObjectsIds = []
+
+      const existingObjects = root[descr.relKey]
+      if (Array.isArray(existingObjects) && existingObjects.length > 0) {
+        existingObjectsIds = existingObjects.map((obj) => obj.id)
+        relatedObjectsIds = _.difference(relatedObjectsIds, existingObjectsIds)
       }
 
-      f(err, json)
+      descr.objectIds = relatedObjectsIds
+
+      return descr
     })
+
+    Reflect.deleteProperty(root, this.RELATIONS_STORAGE);
+
+    const promises = relationsDescr.map(async (rel) => {
+      let relatedObjects = await this.serializeRelation(root, rel.objectIds, rel.model, rel.serializeUsing, level)
+      const existingObjects = root[rel.relKey] || []
+      relatedObjects = relatedObjects || []
+      root[rel.relKey] = relatedObjects.concat(existingObjects)
+      Reflect.deleteProperty(root, rel.objectIdsKey);
+    })
+    return Promise.all(promises)
+  },
+
+  serializeRelation: async (root, objectIds, model, serializer, level) => {
+    const objects = await model.getObjectsByIds(objectIds)
+    const promises = objects.map((object) => {
+      return new serializer(object).promiseToJSON(root, level + 1)
+    })
+    return Promise.all(promises)
   }
 }
-
-AbstractSerializer.prototype.promiseToJSON = promisify(AbstractSerializer.prototype.toJSON)

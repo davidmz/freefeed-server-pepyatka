@@ -1,34 +1,36 @@
-import passport from "passport"
-import jwt from "jsonwebtoken"
-import _ from "lodash"
+import passport from 'koa-passport'
+import jwt from 'jsonwebtoken'
 
-import { load as configLoader } from "../../../../config/config"
-import { UserSerializer } from "../../../models"
+import { load as configLoader } from '../../../../config/config'
+import { UserSerializer } from '../../../models'
 
 
-let config = configLoader()
+const config = configLoader()
 
 export default class SessionController {
-  static create(req, res) {
-    passport.authenticate('local', function(err, user, msg) {
+  static create(ctx) {
+    return passport.authenticate('local', async (err, user, msg) => {
       if (err) {
-        return res.status(401).jsonp({ err: err.message })
+        ctx.status = 401;
+        ctx.body = { err: err.message };
+        return
       }
 
       if (user === false) {
         if (!msg) {
-          msg = 'Internal server error'
+          msg = { message: 'Internal server error' }
         }
 
-        return res.status(401).jsonp({ err: msg })
+        ctx.status = 401;
+        ctx.body = { err: msg.message };
+        return
       }
 
-      var secret = config.secret
-      var authToken = jwt.sign({ userId: user.id }, secret)
+      const secret = config.secret
+      const authToken = jwt.sign({ userId: user.id }, secret)
 
-      new UserSerializer(user).toJSON(function(err, json) {
-        return res.jsonp(_.extend(json, { authToken: authToken }))
-      })
-    })(req, res)
+      const json = await new UserSerializer(user).promiseToJSON();
+      ctx.body = { ...json, authToken };
+    })(ctx);
   }
 }

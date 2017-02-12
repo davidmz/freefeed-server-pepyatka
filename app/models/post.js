@@ -1,6 +1,6 @@
-import monitor from 'monitor-dog'
 import GraphemeBreaker from 'grapheme-breaker'
 import _ from 'lodash'
+import twitter from 'twitter-text'
 
 import { Timeline, PubSub as pubSub } from '../models'
 
@@ -9,14 +9,20 @@ export function addModel(dbAdapter) {
   /**
    * @constructor
    */
-  var Post = function(params) {
-    this.id = params.id
-    this.body = params.body
-    this.attachments = params.attachments
-    this.userId = params.userId
-    this.timelineIds = params.timelineIds
-    this.currentUser = params.currentUser
+  const Post = function (params) {
+    this.id               = params.id
+    this.body             = params.body
+    this.attachments      = params.attachments
+    this.userId           = params.userId
+    this.timelineIds      = params.timelineIds
+    this.currentUser      = params.currentUser
     this.commentsDisabled = params.commentsDisabled
+    this.feedIntIds       = params.feedIntIds || []
+    this.destinationFeedIds = params.destinationFeedIds || []
+    this.commentsCount    = params.commentsCount
+    this.likesCount       = params.likesCount
+    this.isPrivate        = params.isPrivate || '0';
+    this.isProtected      = params.isProtected || '0';
 
     if (parseInt(params.createdAt, 10)) {
       this.createdAt = params.createdAt
@@ -32,92 +38,87 @@ export function addModel(dbAdapter) {
       this.maxComments = params.maxComments
     }
 
-    if (params.maxLikes != 'all') {
-      this.maxLikes = parseInt(params.maxLikes, 10) || 4
+    if (params.maxLikes !== 'all') {
+      this.maxLikes = parseInt(params.maxLikes, 10) || 3
     } else {
       this.maxLikes = params.maxLikes
     }
   }
 
   Post.className = Post
-  Post.namespace = "post"
+  Post.namespace = 'post'
 
-  Object.defineProperty(Post.prototype, 'body', {
-    get: function() { return this.body_ },
-    set: function(newValue) {
+  Reflect.defineProperty(Post.prototype, 'body', {
+    get: function () { return this.body_ },
+    set: function (newValue) {
       newValue ? this.body_ = newValue.trim() : this.body_ = ''
     }
   })
 
-  Post.prototype.validate = async function() {
+  Post.prototype.validate = async function () {
     const valid = this.body
                && this.body.length > 0
                && this.userId
                && this.userId.length > 0
 
     if (!valid) {
-      throw new Error("Invalid")
+      throw new Error('Post text must not be empty')
     }
 
     const len = GraphemeBreaker.countBreaks(this.body)
 
     if (len > 1500) {
-      throw new Error("Maximum post-length is 1500 graphemes")
+      throw new Error('Maximum post-length is 1500 graphemes')
     }
   }
 
-  Post.prototype.create = async function() {
+  Post.prototype.create = async function () {
     this.createdAt = new Date().getTime()
     this.updatedAt = new Date().getTime()
 
     await this.validate()
 
-    var timer = monitor.timer('posts.create-time')
-
-    let payload = {
-      'body': this.body,
-      'userId': this.userId,
-      'createdAt': this.createdAt.toString(),
-      'updatedAt': this.updatedAt.toString(),
+    const payload = {
+      'body':             this.body,
+      'userId':           this.userId,
+      'createdAt':        this.createdAt.toString(),
+      'updatedAt':        this.updatedAt.toString(),
       'commentsDisabled': this.commentsDisabled
     }
+    this.feedIntIds = await dbAdapter.getTimelinesIntIdsByUUIDs(this.timelineIds)
+    this.destinationFeedIds = this.feedIntIds.slice()
     // save post to the database
-    this.id = await dbAdapter.createPost(payload)
+    this.id = await dbAdapter.createPost(payload, this.feedIntIds)
+
+    const newPost = await dbAdapter.getPostById(this.id);
+    this.isPrivate = newPost.isPrivate;
+    this.isProtected = newPost.isProtected;
 
     // save nested resources
-    await Promise.all([
-      this.linkAttachments(),
-      this.savePostedTo()
-    ])
+    await this.linkAttachments()
+    await this.processHashtagsOnCreate()
 
     await Timeline.publishPost(this)
-    var stats = await dbAdapter.getStatsById(this.userId)
-    await stats.addPost()
 
-    timer.stop()
-    monitor.increment('posts.creates')
+    await dbAdapter.statsPostCreated(this.userId)
 
     return this
   }
 
-  Post.prototype.savePostedTo = function() {
-    return dbAdapter.createPostPostedTo(this.id, this.timelineIds)
-  }
-
-  Post.prototype.update = async function(params) {
+  Post.prototype.update = async function (params) {
     // Reflect post changes and validate
     this.updatedAt = new Date().getTime()
     this.body = params.body
     await this.validate()
 
     // Calculate changes in attachments
-    let oldAttachments = await this.getAttachmentIds() || []
-    let newAttachments = params.attachments || []
-    let addedAttachments = newAttachments.filter(i => oldAttachments.indexOf(i) < 0)
-    let removedAttachments = oldAttachments.filter(i => newAttachments.indexOf(i) < 0)
+    const oldAttachments = await this.getAttachmentIds() || []
+    const newAttachments = params.attachments || []
+    const addedAttachments = newAttachments.filter((i) => !oldAttachments.includes(i))
+    const removedAttachments = oldAttachments.filter((i) => !newAttachments.includes(i))
 
     // Update post body in DB
-    let payload = {
+    const payload = {
       'body':      this.body,
       'updatedAt': this.updatedAt.toString()
     }
@@ -129,20 +130,20 @@ export function addModel(dbAdapter) {
       this.unlinkAttachments(removedAttachments)
     ])
 
+    await this.processHashtagsOnUpdate()
+
     // Finally, publish changes
     await pubSub.updatePost(this.id)
 
     return this
   }
 
-  Post.prototype.setCommentsDisabled = async function(newValue) {
+  Post.prototype.setCommentsDisabled = async function (newValue) {
     // Reflect post changes
     this.commentsDisabled = newValue
 
     // Update post body in DB
-    let payload = {
-      'commentsDisabled': this.commentsDisabled
-    }
+    const payload = { 'commentsDisabled': this.commentsDisabled }
     await dbAdapter.updatePost(this.id, payload)
 
     // Finally, publish changes
@@ -151,208 +152,202 @@ export function addModel(dbAdapter) {
     return this
   }
 
-  Post.prototype.destroy = async function() {
-    // remove all comments
-    const comments = await this.getComments()
-    await Promise.all(comments.map(comment => comment.destroy()))
+  Post.prototype.destroy = async function () {
+    await dbAdapter.statsPostDeleted(this.userId, this.id)  // needs data in DB
 
-    // decrement likes counter for users who liked this post
-    const userIds = await this.getLikeIds()
-    const likesStatObjects = await dbAdapter.getStatsByIds(userIds)
-    await Promise.all(likesStatObjects.map(stat => stat.removeLike()))
+// remove all comments
+    const comments = await this.getComments()
+    await Promise.all(comments.map((comment) => comment.destroy()))
 
     const timelineIds = await this.getTimelineIds()
-    const deleteFromTimelinesPromise = Promise.all(timelineIds.map(async (timelineId) => {
-      await Promise.all([
-        dbAdapter.deletePostUsageInTimeline(this.id, timelineId),
-        dbAdapter.removePostFromTimeline(timelineId, this.id)
-      ])
-    }))
-
-    await Promise.all([
-      deleteFromTimelinesPromise,
-      dbAdapter.deletePostPostedTo(this.id),  // delete posted to key
-      dbAdapter.deletePostLikes(this.id),
-      dbAdapter.deletePostComments(this.id)
-    ])
-
+    await dbAdapter.withdrawPostFromFeeds(this.feedIntIds, this.id)
     await dbAdapter.deletePost(this.id)
-    await dbAdapter.deletePostUsagesInTimelineIndex(this.id)  // index of post's timelines
 
     await pubSub.destroyPost(this.id, timelineIds)
-
-    const authorStats = await dbAdapter.getStatsById(this.userId)
-    await authorStats.removePost()
-
-    monitor.increment('posts.destroys')
   }
 
-  Post.prototype.getCreatedBy = function() {
+  Post.prototype.getCreatedBy = function () {
     return dbAdapter.getUserById(this.userId)
   }
 
-  Post.prototype.getSubscribedTimelineIds = async function(groupOnly) {
+  Post.prototype.getSubscribedTimelineIds = async function (groupOnly) {
     if (typeof groupOnly === 'undefined')
       groupOnly = false
 
-    let feed = await dbAdapter.getFeedOwnerById(this.userId)
+    const feed = await dbAdapter.getFeedOwnerById(this.userId)
 
-    let feeds = [feed.getRiverOfNewsTimelineId()]
+    const feeds = [feed.getRiverOfNewsTimelineId()]
     if (!groupOnly)
       feeds.push(feed.getPostsTimelineId())
 
     let timelineIds = await Promise.all(feeds)
-    let newTimelineIds = await this.getTimelineIds()
+    const newTimelineIds = await this.getTimelineIds()
 
     timelineIds = timelineIds.concat(newTimelineIds)
     return _.uniq(timelineIds)
   }
 
-  Post.prototype.getSubscribedTimelines = async function() {
-    var timelineIds = await this.getSubscribedTimelineIds()
+  Post.prototype.getSubscribedTimelines = async function () {
+    const timelineIds = await this.getSubscribedTimelineIds()
     this.subscribedTimelines = await dbAdapter.getTimelinesByIds(timelineIds)
 
     return this.subscribedTimelines
   }
 
-  Post.prototype.getTimelineIds = async function() {
-    var timelineIds = await dbAdapter.getPostUsagesInTimelines(this.id)
+  Post.prototype.getTimelineIds = async function () {
+    const timelineIds = await dbAdapter.getPostUsagesInTimelines(this.id)
     this.timelineIds = timelineIds || []
     return this.timelineIds
   }
 
-  Post.prototype.getTimelines = async function() {
-    var timelineIds = await this.getTimelineIds()
-    this.timelines = await dbAdapter.getTimelinesByIds(timelineIds)
+  Post.prototype.getTimelines = async function () {
+    this.timelines = await dbAdapter.getTimelinesByIntIds(this.feedIntIds)
 
     return this.timelines
   }
 
-  Post.prototype.getPostedToIds = async function() {
-    var timelineIds = await dbAdapter.getPostPostedToIds(this.id)
+  Post.prototype.getPostedToIds = async function () {
+    const timelineIds = await dbAdapter.getTimelinesUUIDsByIntIds(this.destinationFeedIds)
     this.timelineIds = timelineIds || []
     return this.timelineIds
   }
 
-  Post.prototype.getPostedTo = async function() {
-    var timelineIds = await this.getPostedToIds()
-    this.postedTo = await dbAdapter.getTimelinesByIds(timelineIds)
+  Post.prototype.getPostedTo = async function () {
+    this.postedTo = await dbAdapter.getTimelinesByIntIds(this.destinationFeedIds)
 
     return this.postedTo
   }
 
-  Post.prototype.getGenericFriendOfFriendTimelineIds = async function(user, type) {
-    let timelineIds = []
+  Post.prototype.getGenericFriendOfFriendTimelineIntIds = async function (user, type) {
+    const timelineIntIds = []
 
-    let timeline = await user['get' + type + 'Timeline']()
-    timelineIds.push(timeline.id)
+    const userTimelineIntId = await user[`get${type}TimelineIntId`]()
+    timelineIntIds.push(userTimelineIntId)
 
-    let postedToIds = await this.getPostedToIds()
-    let timelines = await dbAdapter.getTimelinesByIds(postedToIds)
-    let timelineOwners = await dbAdapter.getFeedOwnersByIds(timelines.map(tl => tl.userId))
+    const timelines = await dbAdapter.getTimelinesByIntIds(this.destinationFeedIds)
+    const timelineOwners = await dbAdapter.getFeedOwnersByIds(timelines.map((tl) => tl.userId))
 
     // Adds the specified post to River of News if and only if
     // that post has been published to user's Post timeline,
     // otherwise this post will stay in group(s) timelines
     let groupOnly = true
 
-    if (_.any(timelineOwners.map((owner) => owner.isUser()))) {
+    if (_.some(timelineOwners.map((owner) => owner.isUser()))) {
       groupOnly = false
 
-      let feeds = await timeline.getSubscribers()
-      timelineIds.push(...await Promise.all(feeds.map(feed => feed.getRiverOfNewsTimelineId())))
+      const timeline = await dbAdapter.getTimelineByIntId(userTimelineIntId)
+      const subscribersIds = await timeline.getSubscriberIds()
+      const subscribersRiversOfNewsIntIds = await dbAdapter.getUsersNamedFeedsIntIds(subscribersIds, ['RiverOfNews'])
+      timelineIntIds.push(subscribersRiversOfNewsIntIds)
     }
 
-    timelineIds.push(...await this.getSubscribedTimelineIds(groupOnly))
-    timelineIds.push(await user.getRiverOfNewsTimelineId())
-    timelineIds = _.uniq(timelineIds)
+    const postAuthor = await dbAdapter.getFeedOwnerById(this.userId)
+    timelineIntIds.push(await postAuthor.getRiverOfNewsTimelineIntId())
 
-    return timelineIds
+    if (!groupOnly) {
+      timelineIntIds.push(await postAuthor.getPostsTimelineIntId())
+    }
+
+    timelineIntIds.push(await user.getRiverOfNewsTimelineIntId())
+    timelineIntIds.push(this.feedIntIds)
+
+    return _.uniq(_.flatten(timelineIntIds))
   }
 
-  Post.prototype.getGenericFriendOfFriendTimelines = async function(user, type) {
-    let timelineIds = await this.getGenericFriendOfFriendTimelineIds(user, type)
-    return await dbAdapter.getTimelinesByIds(timelineIds)
+  Post.prototype.getLikesFriendOfFriendTimelineIntIds = function (user) {
+    return this.getGenericFriendOfFriendTimelineIntIds(user, 'Likes')
   }
 
-  Post.prototype.getPostsFriendOfFriendTimelineIds = function(user) {
-    return this.getGenericFriendOfFriendTimelineIds(user, 'Posts')
+  Post.prototype.getCommentsFriendOfFriendTimelineIntIds = function (user) {
+    return this.getGenericFriendOfFriendTimelineIntIds(user, 'Comments')
   }
 
-  Post.prototype.getPostsFriendOfFriendTimelines = function(user) {
-    return this.getGenericFriendOfFriendTimelines(user, 'Posts')
-  }
-
-  Post.prototype.getLikesFriendOfFriendTimelineIds = function(user) {
-    return this.getGenericFriendOfFriendTimelineIds(user, 'Likes')
-  }
-
-  Post.prototype.getLikesFriendOfFriendTimelines = function(user) {
-    return this.getGenericFriendOfFriendTimelines(user, 'Likes')
-  }
-
-  Post.prototype.getCommentsFriendOfFriendTimelineIds = function(user) {
-    return this.getGenericFriendOfFriendTimelineIds(user, 'Comments')
-  }
-
-  Post.prototype.getCommentsFriendOfFriendTimelines = function(user) {
-    return this.getGenericFriendOfFriendTimelines(user, 'Comments')
-  }
-
-  Post.prototype.hide = async function(userId) {
+  Post.prototype.hide = async function (userId) {
     const theUser = await dbAdapter.getUserById(userId)
-    const hidesTimelineId = await theUser.getHidesTimelineId()
+    const hidesTimelineId = await theUser.getHidesTimelineIntId()
 
-    await Promise.all([
-      dbAdapter.addPostToTimeline(hidesTimelineId, this.updatedAt, this.id),
-      dbAdapter.createPostUsageInTimeline(this.id, hidesTimelineId)
-    ])
+    await dbAdapter.insertPostIntoFeeds([hidesTimelineId], this.id)
 
     await pubSub.hidePost(theUser.id, this.id)
   }
 
-  Post.prototype.unhide = async function(userId) {
+  Post.prototype.unhide = async function (userId) {
     const theUser = await dbAdapter.getUserById(userId)
-    const hidesTimelineId = await theUser.getHidesTimelineId()
+    const hidesTimelineId = await theUser.getHidesTimelineIntId()
 
-    await Promise.all([
-      dbAdapter.removePostFromTimeline(hidesTimelineId, this.id),
-      dbAdapter.deletePostUsageInTimeline(this.id, hidesTimelineId)
-    ])
+    await dbAdapter.withdrawPostFromFeeds([hidesTimelineId], this.id)
 
     await pubSub.unhidePost(theUser.id, this.id)
   }
 
-  Post.prototype.addComment = async function(comment) {
-    let user = await dbAdapter.getUserById(comment.userId)
+  Post.prototype.addComment = async function (comment) {
+    const user = await dbAdapter.getUserById(comment.userId)
 
-    let timelineIds = await this.getPostedToIds()
+    let timelineIntIds = this.destinationFeedIds.slice()
 
     // only subscribers are allowed to read direct posts
     if (!await this.isStrictlyDirect()) {
-      let moreTimelineIds = await this.getCommentsFriendOfFriendTimelineIds(user)
-      timelineIds.push(...moreTimelineIds)
+      const moreTimelineIntIds = await this.getCommentsFriendOfFriendTimelineIntIds(user)
+      timelineIntIds.push(...moreTimelineIntIds)
 
-      timelineIds = _.uniq(timelineIds)
+      timelineIntIds = _.uniq(timelineIntIds)
     }
 
-    let timelines = await dbAdapter.getTimelinesByIds(timelineIds)
+    let timelines = await dbAdapter.getTimelinesByIntIds(timelineIntIds)
 
     // no need to post updates to rivers of banned users
-    let bannedIds = await user.getBanIds()
+    const bannedIds = await user.getBanIds()
     timelines = timelines.filter((timeline) => !(timeline.userId in bannedIds))
 
-    let promises = timelines.map((timeline) => timeline.updatePost(this.id))
-    promises.push(dbAdapter.addCommentToPost(this.id, comment.id))
-    promises.push(pubSub.newComment(comment, timelines))
-
-    await Promise.all(promises)
+    await this.publishChangesToFeeds(timelines, false)
 
     return timelines
   }
 
-  Post.prototype.getOmittedComments = async function() {
-    const length = await dbAdapter.getPostCommentsCount(this.id)
+  Post.prototype.publishChangesToFeeds = async function (timelines, isLikeAction = false) {
+    const feedsIntIds = timelines.map((t) => t.intId)
+    const insertIntoFeedIds = _.difference(feedsIntIds, this.feedIntIds)
+    const timelineOwnersIds = timelines.map((t) => t.userId)
+    let riversOfNewsOwners = timelines.map((t) => {
+      if (t.isRiverOfNews() && insertIntoFeedIds.includes(t.intId)) {
+        return t.userId
+      }
+      return null
+    })
+
+    riversOfNewsOwners = _.compact(riversOfNewsOwners)
+
+    if (insertIntoFeedIds.length > 0) {
+      await dbAdapter.insertPostIntoFeeds(insertIntoFeedIds, this.id)
+    }
+
+    if (isLikeAction) {
+      if (insertIntoFeedIds.length == 0) {
+        // For the time being, like does not bump post if it is already present in timeline
+        return
+      }
+
+      const promises = riversOfNewsOwners.map((ownerId) => dbAdapter.createLocalBump(this.id, ownerId))
+      await Promise.all(promises)
+
+      return
+    }
+
+    const now = new Date();
+
+    const promises = [
+      dbAdapter.setPostUpdatedAt(this.id, now.getTime()),
+      dbAdapter.setUpdatedAtInGroupsByIds(timelineOwnersIds, now.getTime())
+    ];
+
+    await Promise.all(promises);
+  }
+
+  Post.prototype.getOmittedComments = async function () {
+    let length = this.commentsCount
+    if (length == null) {
+      length = await dbAdapter.getPostCommentsCount(this.id)
+    }
 
     if (length > this.maxComments && length > 3 && this.maxComments != 'all') {
       this.omittedComments = length - this.maxComments
@@ -362,53 +357,48 @@ export function addModel(dbAdapter) {
     return 0
   }
 
-  Post.prototype.getCommentIds = async function() {
-    let length = await dbAdapter.getPostCommentsCount(this.id)
+  Post.prototype.getPostComments = async function () {
+    const comments = await dbAdapter.getAllPostCommentsWithoutBannedUsers(this.id, this.currentUser)
+    const commentsIds = comments.map((cmt) => {
+      return cmt.id
+    })
 
+    const length = comments.length
+    let visibleCommentsIds = commentsIds
+    let visibleComments = comments
     if (length > this.maxComments && length > 3 && this.maxComments != 'all') {
-      // `lrange smth 0 0` means "get elements from 0-th to 0-th" (that will be 1 element)
-      // if `maxComments` is larger than 2, we'll have more comment ids from the beginning of list
-      let commentIds = await dbAdapter.getPostCommentsRange(this.id, 0, this.maxComments - 2)
-      // `lrange smth -1 -1` means "get elements from last to last" (that will be 1 element too)
-      let moreCommentIds = await dbAdapter.getPostCommentsRange(this.id, -1, -1)
+      const firstNCommentIds = commentsIds.slice(0, this.maxComments - 1)
+      const firstNComments   = comments.slice(0, this.maxComments - 1)
+      const lastCommentId = _.last(commentsIds)
+      const lastComment   = _.last(comments)
 
       this.omittedComments = length - this.maxComments
-      this.commentIds = commentIds.concat(moreCommentIds)
-
-      return this.commentIds
-    } else {  // eslint-disable-line no-else-return
-      // get ALL comment ids
-      this.commentIds = await dbAdapter.getPostCommentsRange(this.id, 0, -1)
-      return this.commentIds
+      visibleCommentsIds = firstNCommentIds.concat(lastCommentId)
+      visibleComments = firstNComments.concat(lastComment)
     }
+
+    this.commentIds = visibleCommentsIds
+    return visibleComments
   }
 
-  Post.prototype.getComments = async function() {
-    let banIds = []
-
-    if (this.currentUser) {
-      let user = await dbAdapter.getUserById(this.currentUser)
-      if (user)
-        banIds = await user.getBanIds()
-    }
-
-    let commentIds = await this.getCommentIds()
-    let comments = await dbAdapter.getCommentsByIds(commentIds)
-
-    this.comments = comments.filter(comment => (banIds.indexOf(comment.userId) === -1))
+  Post.prototype.getComments = async function () {
+    this.comments = await this.getPostComments()
 
     return this.comments
   }
 
-  Post.prototype.linkAttachments = async function(attachmentList) {
+  Post.prototype.linkAttachments = async function (attachmentList) {
     const attachmentIds = attachmentList || this.attachments || []
     const attachments = await dbAdapter.getAttachmentsByIds(attachmentIds)
 
-    const attachmentPromises = attachments.map((attachment) => {
+    const attachmentPromises = attachments.filter((attachment) => {
+      // Filter out invalid attachments
+      return attachment.fileSize !== undefined
+    }).map((attachment) => {
       if (this.attachments) {
         const pos = this.attachments.indexOf(attachment.id)
 
-        if (pos < 0) {
+        if (pos === -1) {
           this.attachments.push(attachment)
         } else {
           this.attachments[pos] = attachment
@@ -416,16 +406,14 @@ export function addModel(dbAdapter) {
       }
 
       // Update connections in DB
-      return Promise.all([
-        dbAdapter.addAttachmentToPost(this.id, attachment.id),
-        dbAdapter.setAttachmentPostId(attachment.id, this.id)
-      ])
+
+      return dbAdapter.linkAttachmentToPost(attachment.id, this.id)
     })
 
     await Promise.all(attachmentPromises)
   }
 
-  Post.prototype.unlinkAttachments = async function(attachmentList) {
+  Post.prototype.unlinkAttachments = async function (attachmentList) {
     const attachmentIds = attachmentList || []
     const attachments = await dbAdapter.getAttachmentsByIds(attachmentIds)
 
@@ -433,92 +421,61 @@ export function addModel(dbAdapter) {
       // should we modify `this.attachments` here?
 
       // Update connections in DB
-      return Promise.all([
-        dbAdapter.removeAttachmentsFromPost(this.id, attachment.id),
-        dbAdapter.setAttachmentPostId(attachment.id, '')
-      ])
+      return dbAdapter.unlinkAttachmentFromPost(attachment.id, this.id)
     })
 
     await Promise.all(attachmentPromises)
   }
 
-  Post.prototype.getAttachmentIds = async function() {
+  Post.prototype.getAttachmentIds = async function () {
     this.attachmentIds = await dbAdapter.getPostAttachments(this.id)
     return this.attachmentIds
   }
 
-  Post.prototype.getAttachments = async function() {
-    const attachmentIds = await this.getAttachmentIds()
-    this.attachments = await dbAdapter.getAttachmentsByIds(attachmentIds)
+  Post.prototype.getAttachments = async function () {
+    this.attachments = await dbAdapter.getAttachmentsOfPost(this.id)
 
     return this.attachments
   }
 
-  Post.prototype.getLikeIds = async function() {
-    let length = await dbAdapter.getPostLikesCount(this.id)
+  Post.prototype.getLikeIds = async function () {
+    const omittedLikesCount = await this.getOmittedLikes()
+    let likedUsersIds = await dbAdapter.getPostLikersIdsWithoutBannedUsers(this.id, this.currentUser)
 
-    if (length > this.maxLikes && this.maxLikes != 'all') {
-      let includesUser = await dbAdapter.hasUserLikedPost(this.currentUser, this.id)
+    likedUsersIds = likedUsersIds.sort((a, b) => {
+      if (a == this.currentUser)
+        return -1
 
-      let likeIds = await dbAdapter.getPostLikesRange(this.id, 0, this.maxLikes - 1)
+      if (b == this.currentUser)
+        return 1
 
-      this.likeIds = likeIds
-      this.omittedLikes = length - this.maxLikes
-
-      if (includesUser) {
-        if (likeIds.indexOf(this.currentUser) == -1) {
-          this.likeIds = [this.currentUser].concat(this.likeIds.slice(0, -1))
-        } else {
-          this.likeIds = this.likeIds.sort((a, b) => {
-            if (a == this.currentUser) return -1
-            if (b == this.currentUser) return 1
-          })
-        }
-      }
-
-      return this.likeIds.slice(0, this.maxLikes)
-    } else {  // eslint-disable-line no-else-return
-      let likeIds = await dbAdapter.getPostLikesRange(this.id, 0, -1)
-
-      let to = 0
-      let from = _.findIndex(likeIds, user => (user == this.currentUser))
-
-      if (from > 0) {
-        likeIds.splice(to, 0, likeIds.splice(from, 1)[0])
-      }
-
-      this.likeIds = likeIds
-
-      return this.likeIds
-    }
+      return 0
+    })
+    likedUsersIds.splice(likedUsersIds.length - omittedLikesCount, omittedLikesCount)
+    return likedUsersIds
   }
 
-  Post.prototype.getOmittedLikes = async function() {
-    let length = await dbAdapter.getPostLikesCount(this.id)
-    if (length > this.maxLikes && this.maxLikes != 'all') {
-      this.omittedLikes = length - this.maxLikes
-    } else {
-      this.omittedLikes = 0
+  Post.prototype.getOmittedLikes = async function () {
+    let length = this.likesCount
+    if (length == null) {
+      length = await dbAdapter.getPostLikesCount(this.id)
     }
 
-    return this.omittedLikes
-  }
+    if (this.maxLikes !== 'all') {
+      const threshold = this.maxLikes + 1
 
-  Post.prototype.getLikes = async function() {
-    let banIds = []
-
-    if (this.currentUser) {
-      let user = await dbAdapter.getUserById(this.currentUser)
-
-      if (user) {
-        banIds = await user.getBanIds()
+      if (length > threshold) {
+        return length - this.maxLikes
       }
     }
 
-    let userIds = (await this.getLikeIds())
-      .filter(userId => (banIds.indexOf(userId) === -1))
+    return 0
+  }
 
-    let users = await dbAdapter.getUsersByIds(userIds)
+  Post.prototype.getLikes = async function () {
+    const userIds = await this.getLikeIds()
+
+    const users = await dbAdapter.getUsersByIds(userIds)
 
     // filter non-existant likers
     this.likes = users.filter(Boolean)
@@ -526,14 +483,14 @@ export function addModel(dbAdapter) {
     return this.likes
   }
 
-  Post.prototype.isPrivate = async function() {
-    var timelines = await this.getPostedTo()
+  Post.prototype.isPrivate = async function () {
+    const timelines = await this.getPostedTo()
 
-    var arr = timelines.map(async (timeline) => {
+    const arr = timelines.map(async (timeline) => {
       if (timeline.isDirects())
         return true
 
-      let owner = await dbAdapter.getUserById(timeline.userId)
+      const owner = await dbAdapter.getUserById(timeline.userId)
 
       return (owner.isPrivate === '1')
     })
@@ -542,115 +499,131 @@ export function addModel(dbAdapter) {
     return _.every(await Promise.all(arr))
   }
 
-  Post.prototype.isStrictlyDirect = async function() {
-    let timelines = await this.getPostedTo()
-    let flags = timelines.map((timeline) => timeline.isDirects())
+  Post.prototype.isStrictlyDirect = async function () {
+    const timelines = await this.getPostedTo()
+    const flags = timelines.map((timeline) => timeline.isDirects())
 
     // one non-direct timeline is enough
     return _.every(flags)
   }
 
-  Post.prototype.addLike = async function(user) {
-    await user.validateCanLikePost(this)
+  Post.prototype.addLike = async function (user) {
+    const relevantPostState = await dbAdapter.getPostById(this.id)
+    this.feedIntIds = relevantPostState.feedIntIds
+    this.destinationFeedIds = relevantPostState.destinationFeedIds
 
-    var timer = monitor.timer('posts.likes.time')
-    let timelineIds = await this.getPostedToIds()
+    let timelineIntIds = this.destinationFeedIds.slice()
 
     // only subscribers are allowed to read direct posts
     if (!await this.isStrictlyDirect()) {
-      let moreTimelineIds = await this.getLikesFriendOfFriendTimelineIds(user)
-      timelineIds.push(...moreTimelineIds)
+      const moreTimelineIntIds = await this.getLikesFriendOfFriendTimelineIntIds(user)
+      timelineIntIds.push(...moreTimelineIntIds)
 
-      timelineIds = _.uniq(timelineIds)
+      timelineIntIds = _.uniq(timelineIntIds)
     }
 
-    let timelines = await dbAdapter.getTimelinesByIds(timelineIds)
+    let timelines = await dbAdapter.getTimelinesByIntIds(timelineIntIds)
 
     // no need to post updates to rivers of banned users
-    let bannedIds = await user.getBanIds()
+    const bannedIds = await user.getBanIds()
     timelines = timelines.filter((timeline) => !(timeline.userId in bannedIds))
 
-    let promises = timelines.map((timeline) => timeline.updatePost(this.id, 'like'))
-
-    promises.push(dbAdapter.createUserPostLike(this.id, user.id))
-
-    await Promise.all(promises)
-
-    timer.stop()
-    monitor.increment('posts.likes')
-    monitor.increment('posts.reactions')
+    await dbAdapter.createUserPostLike(this.id, user.id)
+    await this.publishChangesToFeeds(timelines, true)
 
     return timelines
   }
 
-  Post.prototype.removeLike = async function(userId) {
-    let user = await dbAdapter.getUserById(userId)
-    await user.validateCanUnLikePost(this)
-    var timer = monitor.timer('posts.unlikes.time')
-    let timelineId = await user.getLikesTimelineId()
-    let promises = [
-            dbAdapter.removeUserPostLike(this.id, userId),
-            dbAdapter.removePostFromTimeline(timelineId, this.id),
-            dbAdapter.deletePostUsageInTimeline(this.id, timelineId)
-          ]
+  Post.prototype.removeLike = async function (userId) {
+    const user = await dbAdapter.getUserById(userId)
+    const timelineId = await user.getLikesTimelineIntId()
+    const promises = [
+      dbAdapter.removeUserPostLike(this.id, userId),
+      dbAdapter.withdrawPostFromFeeds([timelineId], this.id)
+    ]
     await Promise.all(promises)
     await pubSub.removeLike(this.id, userId)
 
-    timer.stop()
-    monitor.increment('posts.unlikes')
-    monitor.increment('posts.unreactions')
-
-    let stats = await dbAdapter.getStatsById(userId)
-    return stats.removeLike()
+    return true
   }
 
-  Post.prototype.getCreatedBy = function() {
-    return dbAdapter.getUserById(this.userId)
-  }
-
-  Post.prototype.isBannedFor = async function(userId) {
+  Post.prototype.isBannedFor = async function (userId) {
     const user = await dbAdapter.getUserById(userId)
     const banIds = await user.getBanIds()
 
-    const index = banIds.indexOf(this.userId)
-    return index >= 0
+    return banIds.includes(this.userId)
   }
 
-  Post.prototype.isHiddenIn = async function(timeline) {
+  Post.prototype.isHiddenIn = async function (timeline) {
     // hides are applicable only to river
     if (!(timeline.isRiverOfNews() || timeline.isHides()))
       return false
 
-    let owner = await timeline.getUser()
-    let hidesTimelineId = await owner.getHidesTimelineId()
+    const owner = await timeline.getUser()
+    const hidesTimelineIntId = await owner.getHidesTimelineIntId()
 
-    return dbAdapter.isPostPresentInTimeline(hidesTimelineId, this.id)
+    return dbAdapter.isPostPresentInTimeline(hidesTimelineIntId, this.id)
   }
 
-  Post.prototype.canShow = async function(userId) {
-    var timelines = await this.getPostedTo()
+  Post.prototype.canShow = async function (readerId, checkOnlyDestinations = true) {
+    let timelines = await (checkOnlyDestinations ? this.getPostedTo() : this.getTimelines());
 
-    var arr = await Promise.all(timelines.map(async function(timeline) {
-      // owner can read her posts
-      if (timeline.userId === userId)
-        return true
+    if (!checkOnlyDestinations) {
+      timelines = timelines.filter((timeline) => timeline.isPosts() || timeline.isDirects());
+    }
 
-      // if post is already in user's feed then she can read it
-      if (timeline.isDirects())
-        return timeline.userId === userId
+    if (timelines.map((timeline) => timeline.userId).includes(readerId)) {
+      // one of the timelines belongs to the user
+      return true;
+    }
 
-      // this is a public feed, anyone can read public posts, this is
-      // a free country
-      var user = await timeline.getUser()
-      if (user.isPrivate !== '1')
-        return true
+    // skipping someone else's directs
+    const nonDirectTimelines = timelines.filter((timeline) => !timeline.isDirects());
 
-      // otherwise user can view post if and only if she is subscriber
-      var userIds = await timeline.getSubscriberIds()
-      return userIds.indexOf(userId) >= 0
-    }))
+    if (nonDirectTimelines.length === 0) {
+      return false;
+    }
 
-    return _.reduce(arr, function(acc, x) { return acc || x }, false)
+    const ownerIds = nonDirectTimelines.map((timeline) => timeline.userId);
+    if (await dbAdapter.someUsersArePublic(ownerIds, !readerId)) {
+      return true;
+    }
+
+    if (!readerId) {
+      // no public feeds. anonymous can't see
+      return false;
+    }
+
+    const timelineIds = nonDirectTimelines.map((timeline) => timeline.id);
+    return await dbAdapter.isUserSubscribedToOneOfTimelines(readerId, timelineIds);
+  };
+
+  Post.prototype.processHashtagsOnCreate = async function () {
+    const postTags = _.uniq(twitter.extractHashtags(this.body.toLowerCase()))
+
+    if (!postTags || postTags.length == 0) {
+      return
+    }
+    await dbAdapter.linkPostHashtagsByNames(postTags, this.id)
+  }
+
+  Post.prototype.processHashtagsOnUpdate = async function () {
+    const linkedPostHashtags = await dbAdapter.getPostHashtags(this.id)
+
+    const presentTags    = _.sortBy(linkedPostHashtags.map((t) => t.name))
+    const newTags        = _.sortBy(_.uniq(twitter.extractHashtags(this.body.toLowerCase())))
+    const notChangedTags = _.intersection(presentTags, newTags)
+    const tagsToUnlink   = _.difference(presentTags, notChangedTags)
+    const tagsToLink     = _.difference(newTags, notChangedTags)
+
+    if (presentTags != newTags) {
+      if (tagsToUnlink.length > 0) {
+        await dbAdapter.unlinkPostHashtagsByNames(tagsToUnlink, this.id)
+      }
+      if (tagsToLink.length > 0) {
+        await dbAdapter.linkPostHashtagsByNames(tagsToLink, this.id)
+      }
+    }
   }
 
   return Post

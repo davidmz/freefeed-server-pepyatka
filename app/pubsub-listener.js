@@ -1,12 +1,12 @@
 import { promisifyAll } from 'bluebird'
 import { createClient as createRedisClient } from 'redis'
-import _ from 'lodash'
+import { compact, isArray, isPlainObject } from 'lodash'
 import IoServer from 'socket.io'
 import redis_adapter from 'socket.io-redis'
 import jwt from 'jsonwebtoken'
 
-import { dbAdapter, LikeSerializer, PostSerializer, PubsubCommentSerializer } from './models'
 import { load as configLoader } from '../config/config'
+import { dbAdapter, LikeSerializer, PostSerializer, PubsubCommentSerializer } from './models'
 
 
 promisifyAll(jwt)
@@ -17,11 +17,11 @@ export default class PubsubListener {
 
     const config = configLoader()
 
-    var redisPub = createRedisClient(config.redis.port, config.redis.host, config.redis.options)
-      , redisSub = createRedisClient(config.redis.port, config.redis.host, _.extend(config.redis.options, { detect_buffers: true }))
+    const redisPub = createRedisClient(config.redis.port, config.redis.host, config.redis.options)
+    const redisSub = createRedisClient(config.redis.port, config.redis.host, { ...config.redis.options, detect_buffers: true });
 
-    redisPub.on('error', function(err) { app.logger.error('redisPub error', err) })
-    redisSub.on('error', function(err) { app.logger.error('redisSub error', err) })
+    redisPub.on('error', (err) => { app.context.logger.error('redisPub error', err) })
+    redisSub.on('error', (err) => { app.context.logger.error('redisSub error', err) })
 
     this.io = IoServer(server)
     this.io.adapter(redis_adapter({
@@ -29,119 +29,173 @@ export default class PubsubListener {
       subClient: redisSub
     }))
 
-    this.io.sockets.on('error', function(err) { app.logger.error('socket.io error', err) })
-    this.io.sockets.on('connection', this.onConnect.bind(this))
+    this.io.sockets.on('error', (err) => { app.context.logger.error('socket.io error', err) })
+    this.io.sockets.on('connection', this.onConnect)
 
-    var redisClient = createRedisClient(config.redis.port, config.redis.host, {})
-    redisClient.on('error', function(err) { app.logger.error('redis error', err) })
-    redisClient.subscribe('post:new', 'post:destroy', 'post:update',
-      'comment:new', 'comment:destroy', 'comment:update',
-      'like:new', 'like:remove', 'post:hide', 'post:unhide')
+    const redisClient = createRedisClient(config.redis.port, config.redis.host, {})
+    redisClient.on('error', (err) => { app.context.logger.error('redis error', err) })
+    redisClient.subscribe(
+      'user:update',
+      'post:new', 'post:update', 'post:destroy', 'post:hide', 'post:unhide',
+      'comment:new', 'comment:update', 'comment:destroy',
+      'like:new', 'like:remove'
+    )
 
-    redisClient.on('message', this.onRedisMessage.bind(this))
+    redisClient.on('message', this.onRedisMessage)
   }
 
-  async onConnect(socket) {
-    let authToken = socket.handshake.query.token
+  onConnect = async (socket) => {
+    const authToken = socket.handshake.query.token
     const config = configLoader()
-    let secret = config.secret
-    let logger = this.app.logger
+    const secret = config.secret
+    const logger = this.app.context.logger
 
     try {
-      let decoded = await jwt.verifyAsync(authToken, secret)
+      const decoded = await jwt.verifyAsync(authToken, secret)
       socket.user = await dbAdapter.getUserById(decoded.userId)
-    } catch(e) {
+    } catch (e) {
       socket.user = { id: null }
     }
 
-    socket.on('subscribe', function(data) {
-      for (let channel of Object.keys(data)) {
-        if (data[channel]) {
-          data[channel].forEach(function(id) {
-            if (id) {
-              logger.info('User has subscribed to ' + id + ' ' + channel)
+    socket.on('error', (e) => {
+      logger.error('socket.io socket error', e);
+    });
 
-              socket.join(channel + ':' + id)
-            }
-          })
+    socket.on('subscribe', (data) => {
+      if (!isPlainObject(data)) {
+        logger.warn('socket.io got "subscribe" request without data');
+        return;
+      }
+
+
+      for (const channel of Object.keys(data)) {
+        if (!isArray(data[channel])) {
+          logger.warn('socket.io got "unsubscribe" request with bogus list of channels');
+          continue;
         }
+
+        data[channel].filter(Boolean).forEach((id) => {
+          socket.join(`${channel}:${id}`)
+          logger.info(`User has subscribed to ${id} ${channel}`)
+        })
       }
     })
 
-    socket.on('unsubscribe', function(data) {
-      for (let channel of Object.keys(data)) {
-        if (data[channel]) {
-          data[channel].forEach(function(id) {
-            if (id) {
-              logger.info('User has unsubscribed from ' + id + ' ' + channel)
+    socket.on('unsubscribe', (data) => {
+      if (!isPlainObject(data)) {
+        logger.warn('socket.io got "unsubscribe" request without data');
+        return;
+      }
 
-              socket.leave(channel + ':' + id)
-            }
-          })
+      for (const channel of Object.keys(data)) {
+        if (!isArray(data[channel])) {
+          logger.warn('socket.io got "unsubscribe" request with bogus list of channels');
+          continue;
         }
+
+        data[channel].filter(Boolean).forEach((id) => {
+          socket.leave(`${channel}:${id}`)
+          logger.info(`User has unsubscribed from ${id} ${channel}`)
+        })
       }
     })
   }
 
-  onRedisMessage(channel, msg) {
+  onRedisMessage = async (channel, msg) => {
     const messageRoutes = {
-      'post:new':         this.onPostNew.bind(this),
-      'post:update':      this.onPostUpdate.bind(this),
-      'post:destroy':     this.onPostDestroy.bind(this),
-      'post:hide':        this.onPostHide.bind(this),
-      'post:unhide':      this.onPostUnhide.bind(this),
+      'user:update': this.onUserUpdate,
 
-      'comment:new':      this.onCommentNew.bind(this),
-      'comment:update':   this.onCommentUpdate.bind(this),
-      'comment:destroy':  this.onCommentDestroy.bind(this),
+      'post:new':     this.onPostNew,
+      'post:update':  this.onPostUpdate,
+      'post:destroy': this.onPostDestroy,
+      'post:hide':    this.onPostHide,
+      'post:unhide':  this.onPostUnhide,
 
-      'like:new':         this.onLikeNew.bind(this),
-      'like:remove':      this.onLikeRemove.bind(this)
+      'comment:new':     this.onCommentNew,
+      'comment:update':  this.onCommentUpdate,
+      'comment:destroy': this.onCommentDestroy,
+
+      'like:new':    this.onLikeNew,
+      'like:remove': this.onLikeRemove
     }
 
     messageRoutes[channel](
       this.io.sockets,
       JSON.parse(msg)
-    ).catch(e => { this.app.logger.error('onRedisMessage error', e )})
+    ).catch((e) => { this.app.context.logger.error('onRedisMessage error', e)})
   }
 
   async validateAndEmitMessage(sockets, room, type, json, post) {
+    const logger = this.app.context.logger
+
     if (!(room in sockets.adapter.rooms)) {
       return
     }
 
-    let clientIds = Object.keys(sockets.adapter.rooms[room])
+    const clientIds = Object.keys(sockets.adapter.rooms[room])
 
     await Promise.all(clientIds.map(async (clientId) => {
-      let socket = sockets.connected[clientId]
-      let user = socket.user
-      let logger = this.app.logger
+      const socket = sockets.connected[clientId]
+      const user = socket.user
 
-      if (!post) {
-        logger.error('post is null in validateAndEmitMessage')
-        return
-      }
       if (!user) {
         logger.error('user is null in validateAndEmitMessage')
         return
       }
 
-      let valid = await post.canShow(user.id)
+      if (post) {
+        if (!(await post.canShow(user.id))) {
+          return;
+        }
 
-      if (valid)
-        socket.emit(type, json)
+        if (user.id) {  // otherwise, it is an anonymous user
+          const banIds = await user.getBanIds()
+
+          if (banIds.includes(post.userId)) {
+            return;
+          }
+
+          const authorBans = await dbAdapter.getUserBansIds(post.userId)
+
+          if (authorBans.includes(user.id)) {
+            return;
+          }
+
+          if (type === 'comment:new' || type === 'comment:update') {
+            const uid = json.comments.createdBy;
+
+            if (banIds.includes(uid)) {
+              return;
+            }
+          }
+
+          if (type === 'like:new') {
+            const uid = json.users.id;
+
+            if (banIds.includes(uid)) {
+              return;
+            }
+          }
+        }
+      }
+
+      socket.emit(type, json)
     }))
   }
 
+  onUserUpdate = async (sockets, data) => {
+    sockets.in(`user:${data.user.id}`).emit('user:update', data);
+  };
+
   // Message-handlers follow
-  async onPostDestroy(sockets, data) {
-    let post = await dbAdapter.getPostById(data.postId)
-    let json = { meta: { postId: data.postId } }
+  onPostDestroy = async (sockets, data) => {
+    const post = await dbAdapter.getPostById(data.postId)
+    const json = { meta: { postId: data.postId } }
 
-    sockets.in('timeline:' + data.timelineId).emit('post:destroy', json)
-    sockets.in('post:' + data.postId).emit('post:destroy', json)
+    sockets.in(`timeline:${data.timelineId}`).emit('post:destroy', json)
+    sockets.in(`post:${data.postId}`).emit('post:destroy', json)
 
-    let type = 'post:destroy'
+    const type = 'post:destroy'
     let room = `timeline:${data.timelineId}`
     await this.validateAndEmitMessage(sockets, room, type, json, post)
 
@@ -149,129 +203,183 @@ export default class PubsubListener {
     await this.validateAndEmitMessage(sockets, room, type, json, post)
   }
 
-  async onPostNew(sockets, data) {
-    let post = await dbAdapter.getPostById(data.postId)
-    let json = await new PostSerializer(post).promiseToJSON()
+  onPostNew = async (sockets, data) => {
+    const post = await dbAdapter.getPostById(data.postId)
+    const timelines = await post.getTimelines()
 
-    let type = 'post:new'
-    let room = `timeline:${data.timelineId}`
+    const feedIdsPromises = timelines.map(async (timeline) => {
+      const isBanned = await post.isBannedFor(timeline.userId)
 
-    await this.validateAndEmitMessage(sockets, room, type, json, post)
+      if (!isBanned) {
+        return timeline.id
+      }
+
+      return null
+    })
+
+    let feedIds = await Promise.all(feedIdsPromises)
+    feedIds = compact(feedIds)
+
+    const json = await new PostSerializer(post).promiseToJSON()
+
+    const type = 'post:new'
+    const promises = feedIds.map((feedId) => {
+      const room = `timeline:${feedId}`
+      return this.validateAndEmitMessage(sockets, room, type, json, post)
+    })
+    await Promise.all(promises)
   }
 
-  async onPostUpdate(sockets, data) {
-    let post = await dbAdapter.getPostById(data.postId)
-    let json = await new PostSerializer(post).promiseToJSON()
+  onPostUpdate = async (sockets, data) => {
+    const post = await dbAdapter.getPostById(data.postId)
+    const timelineIds = await post.getTimelineIds()
+    const json = await new PostSerializer(post).promiseToJSON()
 
-    let type = 'post:update'
+    const type = 'post:update'
     let room
 
-    if (data.timelineId) {
-      room = `timeline:${data.timelineId}`
-    } else {
-      room = `post:${data.postId}`
-    }
+    const promises = timelineIds.map(async (timelineId) => {
+      room = `timeline:${timelineId}`
+      return this.validateAndEmitMessage(sockets, room, type, json, post)
+    })
+    await Promise.all(promises)
+
+    room = `post:${data.postId}`
     await this.validateAndEmitMessage(sockets, room, type, json, post)
   }
 
-  async onCommentNew(sockets, data) {
-    let comment = await dbAdapter.getCommentById(data.commentId)
+  onCommentNew = async (sockets, data) => {
+    const comment = await dbAdapter.getCommentById(data.commentId)
 
     if (!comment) {
       // might be outdated event
       return
     }
 
-    let post = await dbAdapter.getPostById(comment.postId)
-    let json = await new PubsubCommentSerializer(comment).promiseToJSON()
+    const post = await dbAdapter.getPostById(comment.postId)
+    const json = await new PubsubCommentSerializer(comment).promiseToJSON()
 
-    let type = 'comment:new'
+    const timelines = await dbAdapter.getTimelinesByIds(data.timelineIds)
+    const timelinePromises = timelines.map(async (timeline) => {
+      if (await post.isHiddenIn(timeline))
+        return null
+
+      return timeline.id
+    })
+
+    let actualTimelineIds = await Promise.all(timelinePromises)
+    actualTimelineIds = compact(actualTimelineIds)
+
+    const type = 'comment:new'
     let room
 
-    if (data.timelineId) {
-      room = `timeline:${data.timelineId}`
-    } else {
-      room = `post:${data.postId}`
-    }
+    const promises = actualTimelineIds.map((timelineId) => {
+      room = `timeline:${timelineId}`
+      return this.validateAndEmitMessage(sockets, room, type, json, post)
+    })
 
+    await Promise.all(promises)
+
+    room = `post:${post.id}`
     await this.validateAndEmitMessage(sockets, room, type, json, post)
   }
 
-  async onCommentUpdate(sockets, data) {
-    let comment = await dbAdapter.getCommentById(data.commentId)
-    let post = await dbAdapter.getPostById(comment.postId)
-    let json = await new PubsubCommentSerializer(comment).promiseToJSON()
+  onCommentUpdate = async (sockets, data) => {
+    const comment = await dbAdapter.getCommentById(data.commentId)
+    const post = await dbAdapter.getPostById(comment.postId)
+    const json = await new PubsubCommentSerializer(comment).promiseToJSON()
 
-    let type = 'comment:update'
-    let room
-
-    if (data.timelineId) {
-      room = `timeline:${data.timelineId}`
-    } else {
-      room = `post:${data.postId}`
-    }
-
+    const type = 'comment:update'
+    let room = `post:${post.id}`
     await this.validateAndEmitMessage(sockets, room, type, json, post)
+
+    const timelineIds = await post.getTimelineIds()
+    const promises = timelineIds.map(async (timelineId) => {
+      room = `timeline:${timelineId}`
+      await this.validateAndEmitMessage(sockets, room, type, json, post)
+    })
+    await Promise.all(promises)
   }
 
-  async onCommentDestroy(sockets, data) {
-    let json = { postId: data.postId, commentId: data.commentId }
-    let post = await dbAdapter.getPostById(data.postId)
-    
-    let type = 'comment:destroy'
-    let room
-    if (data.timelineId) {
-      room = `timeline:${data.timelineId}`
-    } else {
-      room = `post:${data.postId}`
-    }
+  onCommentDestroy = async (sockets, data) => {
+    const json = { postId: data.postId, commentId: data.commentId }
+    const post = await dbAdapter.getPostById(data.postId)
+
+    const type = 'comment:destroy'
+    let room = `post:${data.postId}`
     await this.validateAndEmitMessage(sockets, room, type, json, post)
+
+    if (post) {
+      const timelineIds = await post.getTimelineIds();
+      const promises = timelineIds.map(async (timelineId) => {
+        room = `timeline:${timelineId}`;
+        await this.validateAndEmitMessage(sockets, room, type, json, post)
+      });
+
+      await Promise.all(promises);
+    }
   }
 
-  async onLikeNew(sockets, data) {
-    let user = await dbAdapter.getUserById(data.userId)
-    let json = await new LikeSerializer(user).promiseToJSON()
-    let post = await dbAdapter.getPostById(data.postId)
+  onLikeNew = async (sockets, data) => {
+    const user = await dbAdapter.getUserById(data.userId)
+    const json = await new LikeSerializer(user).promiseToJSON()
+    const post = await dbAdapter.getPostById(data.postId)
     json.meta = { postId: data.postId }
 
-    let type = 'like:new'
-    let room
-    if (data.timelineId) {
-      room = `timeline:${data.timelineId}`
-    } else {
-      room = `post:${data.postId}`
-    }
+    const timelines = await dbAdapter.getTimelinesByIds(data.timelineIds)
+    const timelinePromises = timelines.map(async (timeline) => {
+      if (await post.isHiddenIn(timeline))
+        return null
 
+      return timeline.id
+    })
+
+    let actualTimelineIds = await Promise.all(timelinePromises)
+    actualTimelineIds = compact(actualTimelineIds)
+
+    const type = 'like:new'
+    let room
+
+    const promises = actualTimelineIds.map((timelineId) => {
+      room = `timeline:${timelineId}`
+      return this.validateAndEmitMessage(sockets, room, type, json, post)
+    })
+
+    await Promise.all(promises)
+
+    room = `post:${data.postId}`
     await this.validateAndEmitMessage(sockets, room, type, json, post)
   }
 
-  async onLikeRemove(sockets, data) {
-    let json = { meta: { userId: data.userId, postId: data.postId } }
-    let post = await dbAdapter.getPostById(data.postId)
+  onLikeRemove = async (sockets, data) => {
+    const json = { meta: { userId: data.userId, postId: data.postId } }
+    const post = await dbAdapter.getPostById(data.postId)
 
-    let type = 'like:remove'
-    let room
-
-    if (data.timelineId) {
-      room = `timeline:${data.timelineId}`
-    } else {
-      room = `post:${data.postId}`
-    }
+    const type = 'like:remove'
+    let room = `post:${data.postId}`
 
     await this.validateAndEmitMessage(sockets, room, type, json, post)
+
+    const timelineIds = await post.getTimelineIds()
+    const promises = timelineIds.map(async (timelineId) => {
+      room = `timeline:${timelineId}`
+      await this.validateAndEmitMessage(sockets, room, type, json, post)
+    })
+
+    await Promise.all(promises)
   }
 
-  async onPostHide(sockets, data) {
+  onPostHide = async (sockets, data) => {
     // NOTE: posts are hidden only on RiverOfNews timeline so this
     // event won't leak any personal information
-    let json = { meta: { postId: data.postId } }
-    sockets.in('timeline:' + data.timelineId).emit('post:hide', json)
+    const json = { meta: { postId: data.postId } }
+    sockets.in(`timeline:${data.timelineId}`).emit('post:hide', json)
   }
 
-  async onPostUnhide(sockets, data) {
+  onPostUnhide = async (sockets, data) => {
     // NOTE: posts are hidden only on RiverOfNews timeline so this
     // event won't leak any personal information
-    let json = { meta: { postId: data.postId } }
-    sockets.in('timeline:' + data.timelineId).emit('post:unhide', json)
+    const json = { meta: { postId: data.postId } }
+    sockets.in(`timeline:${data.timelineId}`).emit('post:unhide', json)
   }
 }
